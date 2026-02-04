@@ -52,7 +52,7 @@ class MultimodalFmriDataset(Dataset):
         # 3. Caricamento Mappe (Depth & Segmentation)
         if self.load_maps:
             # Percorsi generati dallo script di preprocessing
-            depth_path = os.path.join(self.root, "derived_maps", "depth", self.split, key + ".png")#_quantized_visible
+            depth_path = os.path.join(self.root, "derived_maps", "depth_quantized_visible", self.split, key + ".png")#
             seg_path = os.path.join(self.root, "derived_maps", "segmentation", self.split, key + ".png")
             
             # Depth (Grayscale -> 1 canale)

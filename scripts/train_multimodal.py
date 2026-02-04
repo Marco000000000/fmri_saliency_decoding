@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # Imposta la GPU specifica come richiesto
 import sys
 import pickle
 import numpy as np

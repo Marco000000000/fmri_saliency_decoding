@@ -26,7 +26,7 @@ def main():
     model.to(device)
     model.eval()
 
-    train_img_dir = os.path.join(dataset_root, "images", "training")
+    train_img_dir = os.path.join(dataset_root, "images", "test")
     images_list = sorted([f for f in os.listdir(train_img_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
 
     print(f"Generazione Silhouette Salienti 64x64 per {len(images_list)} immagini...")

@@ -36,7 +36,10 @@ else
     echo "Task ID non valido!"
     exit 1
 fi
+source $(conda info --base)/etc/profile.d/conda.sh
 
+# 2. Attiva l'ambiente (Questa è la tua "concatenazione")
+conda activate labram
 echo -e "${GREEN}====================================================${NC}"
 echo -e "${GREEN}🚀 INIZIO JOB [ID: ${TASK_ID}] -> DATASET: ${DATASET^^} | SOGGETTO: ${SUBJECT} ${NC}"
 echo -e "${GREEN}====================================================${NC}"

@@ -78,26 +78,24 @@ def get_n_way(g_list, t_list):
     return (t1 / len(g_list)) * 100, (t5 / len(g_list)) * 100
 
 def apply_smart_mask(img_pil, mask_np, bbox, mode):
-    """Applica BBox Crop per FG e Heavy Blur per BG"""
+    """Applica Blur simmetrico e BBox Crop per FG"""
     if mode == "full" or mask_np is None:
         return img_pil
         
-    mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8)).resize((512, 512), Image.NEAREST)
+    mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(img_pil.size, Image.NEAREST)
+    blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=30))
     
     if mode == "foreground":
-        # Composizione col nero
-        black_bg = Image.new("RGB", (512, 512), "black")
-        isolated = Image.composite(img_pil, black_bg, mask_pil.convert("L"))
-        # Crop alla Bounding Box e rescale per massimizzare il soggetto
+        # Incolla il soggetto nitido sullo sfondo sfocato
+        fg_isolated = Image.composite(img_pil, blurred_img, mask_pil.convert("L"))
+        # Ritaglia la Bounding Box per zoomare
         if bbox:
-            isolated = isolated.crop(bbox).resize((512, 512), Image.BICUBIC)
-        return isolated
+            return fg_isolated.crop(bbox).resize(img_pil.size, Image.BICUBIC)
+        return fg_isolated
         
     elif mode == "background":
-        # Blur pesante su tutta l'immagine
-        blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=30))
+        # Incolla lo sfondo nitido sul soggetto sfocato
         inv_mask = ImageOps.invert(mask_pil.convert("L"))
-        # Incolliamo lo sfondo nitido sopra l'immagine sfocata
         return Image.composite(img_pil, blurred_img, inv_mask)
 
 def main():
@@ -210,12 +208,11 @@ def main():
             mask_path = os.path.join(masks_dir, id_to_maskname[f])
             if os.path.exists(mask_path): 
                 mask_np = np.load(mask_path).reshape(64, 64)
-                # Estrazione BBox sulla maschera 64x64 poi scalata a 512
                 mask_pil_64 = Image.fromarray((mask_np * 255).astype(np.uint8))
                 bbox_64 = mask_pil_64.getbbox()
                 if bbox_64: bbox = (bbox_64[0]*8, bbox_64[1]*8, bbox_64[2]*8, bbox_64[3]*8)
 
-        # Smart Masking sulla Ground Truth
+        # Smart Masking SOLO sulla Ground Truth (Target Semantico)
         gt_pil = apply_smart_mask(gt_pil, mask_np, bbox, args.eval_mode)
 
         N += 1
@@ -246,10 +243,9 @@ def main():
             for m in methods:
                 gen_path = os.path.join(parent_dir, m, f)
                 if not os.path.exists(gen_path): continue
-                gen_pil = Image.open(gen_path).convert("RGB").resize((512, 512))
                 
-                # Smart Masking anche sull'immagine generata
-                gen_pil = apply_smart_mask(gen_pil, mask_np, bbox, args.eval_mode)
+                # Le immagini generate rimangono INTERE e INTATTE (come escono dal modello)
+                gen_pil = Image.open(gen_path).convert("RGB").resize((512, 512))
 
                 t_gen_lpips = (F_vision.to_tensor(gen_pil).to(device) * 2.0 - 1.0).unsqueeze(0)
                 results[m]['lpips'].append(loss_fn_vgg(t_gen_lpips, t_gt_lpips).item())

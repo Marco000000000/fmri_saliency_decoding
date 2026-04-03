@@ -16,6 +16,20 @@ class SimpleLinearAligner(nn.Module):
         self.linear = nn.Linear(input_dim, clip_dim) 
     def forward(self, x): return self.linear(x)
 
+def apply_smart_mask(img_pil, mask_np, bbox, mode):
+    """Applica Blur simmetrico e BBox Crop per FG"""
+    if mode == "full" or mask_np is None: return img_pil
+    mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(img_pil.size, Image.NEAREST)
+    blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=30))
+    
+    if mode == "foreground":
+        fg_isolated = Image.composite(img_pil, blurred_img, mask_pil.convert("L"))
+        if bbox: return fg_isolated.crop(bbox).resize(img_pil.size, Image.BICUBIC)
+        return fg_isolated
+    elif mode == "background":
+        inv_mask = ImageOps.invert(mask_pil.convert("L"))
+        return Image.composite(img_pil, blurred_img, inv_mask)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--subject", type=int, default=1)
@@ -66,31 +80,19 @@ def main():
             
             if os.path.exists(img_path) and os.path.exists(mask_path):
                 img = Image.open(img_path).convert("RGB")
-                mask_flat = np.load(mask_path)
-                mask_pil_64 = Image.fromarray((mask_flat.reshape(64, 64) * 255).astype(np.uint8))
-                mask_pil = mask_pil_64.resize(img.size, Image.NEAREST)
+                mask_flat = np.load(mask_path).reshape(64, 64)
+                mask_pil_64 = Image.fromarray((mask_flat * 255).astype(np.uint8))
                 
-                final_img = img
-                if args.mask_mode == "foreground":
-                    black_bg = Image.new("RGB", img.size, "black")
-                    isolated = Image.composite(img, black_bg, mask_pil.convert("L"))
-                    
-                    bbox_64 = mask_pil_64.getbbox()
-                    if bbox_64:
-                        scale_x, scale_y = img.size[0] / 64.0, img.size[1] / 64.0
-                        scaled_bbox = (int(bbox_64[0]*scale_x), int(bbox_64[1]*scale_y), int(bbox_64[2]*scale_x), int(bbox_64[3]*scale_y))
-                        isolated = isolated.crop(scaled_bbox).resize(img.size, Image.BICUBIC)
-                        
-                    final_img = isolated
-                    
-                elif args.mask_mode == "background":
-                    blurred_img = img.filter(ImageFilter.GaussianBlur(radius=30))
-                    inv_mask = ImageOps.invert(mask_pil.convert("L"))
-                    final_img = Image.composite(img, blurred_img, inv_mask)
+                bbox_64 = mask_pil_64.getbbox()
+                bbox = None
+                if bbox_64:
+                    scale_x, scale_y = img.size[0] / 64.0, img.size[1] / 64.0
+                    bbox = (int(bbox_64[0]*scale_x), int(bbox_64[1]*scale_y), int(bbox_64[2]*scale_x), int(bbox_64[3]*scale_y))
+                
+                final_img = apply_smart_mask(img, mask_flat, bbox, args.mask_mode)
                     
                 inputs = clip_processor(images=final_img, return_tensors="pt").to(device)
-                with torch.no_grad(): 
-                    clip_embeddings[img_id_int] = clip_model(**inputs).image_embeds.cpu()
+                with torch.no_grad(): clip_embeddings[img_id_int] = clip_model(**inputs).image_embeds.cpu()
 
     del clip_model
     torch.cuda.empty_cache()
@@ -125,8 +127,7 @@ def main():
             optimizer.zero_grad()
             loss = criterion(aligner(X_train), Y_train)
             reg_loss = 0
-            for param in aligner.parameters():
-                reg_loss += (0.5 * l2_lambda * torch.sum(param ** 2)) + (l1_lambda * torch.sum(torch.sqrt(param ** 2 + 1e-6)))
+            for param in aligner.parameters(): reg_loss += (0.5 * l2_lambda * torch.sum(param ** 2)) + (l1_lambda * torch.sum(torch.sqrt(param ** 2 + 1e-6)))
             loss += reg_loss
             loss.backward()
             return loss
@@ -143,5 +144,4 @@ def main():
             print(" [SAVED]")
         else: print("")
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

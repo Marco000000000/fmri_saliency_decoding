@@ -1,158 +1,109 @@
+import argparse
 import os
-import glob
-import tarfile
-import io
-import json
-import random
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import sys
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from PIL import Image
-from transformers import DPTImageProcessor, DPTForDepthEstimation
+from PIL import Image, ImageOps, ImageFilter
 from tqdm import tqdm
 
-class SimpleLinearAligner(nn.Module):
-    def __init__(self, input_dim, output_dim=4096):
-        super().__init__()
-        self.linear = nn.Linear(input_dim, output_dim) 
-    def forward(self, x): return self.linear(x)
-
-def get_train_stats(train_dir):
-    """Estrae tutti i fMRI di train solo per calcolare Media e Std per lo Z-Score."""
-    print("⚖️ Calcolo Z-Score dal Train Set...")
-    X_train = []
-    for tf in tqdm(glob.glob(os.path.join(train_dir, "*.tar")), desc="Lettura fMRI Train"):
-        with tarfile.open(tf, "r") as tar:
-            fmri_member = next((m for m in tar.getmembers() if m.name.endswith('.voxel.pyd')), None)
-            if fmri_member:
-                X_train.append(np.load(io.BytesIO(tar.extractfile(fmri_member).read()), allow_pickle=True).flatten())
-    X_train = torch.tensor(np.array(X_train), dtype=torch.float32)
-    return X_train.mean(dim=0, keepdim=True), X_train.std(dim=0, keepdim=True), X_train.shape[1]
-
-def get_midas_gt(img, processor, model, device):
-    """Genera la vera Mappa di Profondità (Ground Truth) al volo per il plot."""
-    inputs = processor(images=img, return_tensors="pt").to(device)
-    with torch.no_grad():
-        depth = model(**inputs).predicted_depth
-        depth_64 = F.interpolate(depth.unsqueeze(1), size=(64, 64), mode="bicubic", align_corners=False).squeeze()
-        d_min, d_max = depth_64.min(), depth_64.max()
-        norm_depth = (depth_64 - d_min) / (d_max - d_min + 1e-8)
-    return norm_depth.cpu().numpy()
+def apply_smart_mask(img_pil, mask_np, bbox, mode):
+    """Applica Blur simmetrico e BBox Crop per FG"""
+    if mode == "full" or mask_np is None:
+        return img_pil
+        
+    mask_pil = Image.fromarray((mask_np * 255).astype(np.uint8)).resize(img_pil.size, Image.NEAREST)
+    blurred_img = img_pil.filter(ImageFilter.GaussianBlur(radius=30))
+    
+    if mode == "foreground":
+        # Incolla il soggetto nitido sullo sfondo sfocato
+        fg_isolated = Image.composite(img_pil, blurred_img, mask_pil.convert("L"))
+        # Ritaglia la Bounding Box per zoomare
+        if bbox:
+            return fg_isolated.crop(bbox).resize(img_pil.size, Image.BICUBIC)
+        return fg_isolated
+        
+    elif mode == "background":
+        # Incolla lo sfondo nitido sul soggetto sfocato
+        inv_mask = ImageOps.invert(mask_pil.convert("L"))
+        return Image.composite(img_pil, blurred_img, inv_mask)
 
 def main():
-    subject = "CSI1"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_data_dir = "/home/mfinocchiaro/Kamitani_fMRI/Dataset_Kamitani/preprocessed/fmri_saliency_decoding/data/WAVE-BOLD5000"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=["god", "shen"], default="god")
+    parser.add_argument("--test_type", choices=["natural", "shapes", "letters"], default="natural")
+    parser.add_argument("--num_images", type=int, default=20, help="Quante immagini visualizzare")
+    args = parser.parse_args()
+
+    base_dir = "/home/mfinocchiaro/Kamitani_fMRI/Dataset_Kamitani/preprocessed/fmri_saliency_decoding"
+    masks_dir = f"{base_dir}/data/precomputed_binary_masks"
+    out_dir = f"mask_visualizations_{args.dataset}"
+    os.makedirs(out_dir, exist_ok=True)
     
-    train_dir = os.path.join(base_data_dir, subject, "train")
-    test_dir = os.path.join(base_data_dir, subject, "test")
+    if args.dataset == "shen":
+        tsv_path = f"{base_dir}/data/Shen2019/stimuli/stimulus_NaturalImageTest.tsv"
+        gt_dir = f"{base_dir}/data/GOD_Dataset/images/test"
+        ext = ".JPEG"
+    else: 
+        tsv_path = f"{base_dir}/data/Shen2019/stimuli/stimulus_NaturalImageTest.tsv" 
+        gt_dir = f"{base_dir}/data/GOD_Dataset/images/test"
+        ext = ".JPEG"
 
-    # 1. Z-Scoring
-    x_mean, x_std, voxel_dim = get_train_stats(train_dir)
-    x_mean, x_std = x_mean.to(device), x_std.to(device)
+    df_tsv = pd.read_csv(tsv_path, sep='\t', header=None)
+    id_to_filename, id_to_maskname = {}, {}
+    for _, row in df_tsv.iterrows():
+        img_id, fname = int(row[3]), str(row[0]).strip()
+        if args.dataset == "god":
+            key = f"{fname}{ext}" if not fname.endswith(ext) else fname
+            id_to_filename[key] = key
+            id_to_maskname[key] = f"{fname}.npy"
+        else:
+            key = f"id_{img_id}.png"
+            id_to_filename[key] = f"{fname}{ext}" if not fname.endswith(ext) else fname
+            id_to_maskname[key] = f"{fname}.npy"
 
-    # 2. Caricamento Modelli
-    print("\n🧠 Caricamento Decodificatore Depth...")
-    aligner = SimpleLinearAligner(voxel_dim, output_dim=4096).to(device)
-    aligner.load_state_dict(torch.load(f"trained_fmri_decoders/bold5000_depth_tar/{subject}_depth_aligner.pth", map_location=device))
-    aligner.eval()
+    files_to_process = list(id_to_filename.keys())[:args.num_images]
+    print(f"🎨 Generazione Plot per {len(files_to_process)} immagini di Test ({args.dataset.upper()})...")
 
-    print("📏 Caricamento MiDaS (DPT) per calcolo Ground Truth...")
-    depth_processor = DPTImageProcessor.from_pretrained("Intel/dpt-large")
-    depth_model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large").to(device).eval()
-
-    # ==========================================
-    # ELABORAZIONE TRAIN SET (Senza media, 4 sample random)
-    # ==========================================
-    print("\n🔍 Campionamento Train Set...")
-    train_tars = random.sample(glob.glob(os.path.join(train_dir, "*.tar")), 4)
-    train_results = []
-    
-    for tf in train_tars:
-        with tarfile.open(tf, "r") as tar:
-            img_m = next(m for m in tar.getmembers() if m.name.endswith('.png'))
-            fmri_m = next(m for m in tar.getmembers() if m.name.endswith('.voxel.pyd'))
+    for f in tqdm(files_to_process):
+        gt_path = os.path.join(gt_dir, id_to_filename[f])
+        if not os.path.exists(gt_path): continue
             
-            img = Image.open(tar.extractfile(img_m)).convert("RGB")
-            gt_depth = get_midas_gt(img, depth_processor, depth_model, device)
-            
-            fmri_raw = np.load(io.BytesIO(tar.extractfile(fmri_m).read()), allow_pickle=True).flatten()
-            fmri_vec = torch.tensor(fmri_raw, dtype=torch.float32).to(device).unsqueeze(0)
-            fmri_z = (fmri_vec - x_mean) / (x_std + 1e-6)
-            
-            with torch.no_grad():
-                pred_depth = aligner(fmri_z).cpu().numpy().reshape(64, 64)
-                
-            train_results.append((img, gt_depth, pred_depth))
-
-    # ==========================================
-    # ELABORAZIONE TEST SET (Con Media delle ripetizioni!)
-    # ==========================================
-    print("🔍 Raggruppamento e Media del Test Set...")
-    test_dict = {} # img_name -> {'fmris': [], 'img': PIL}
-    
-    for tf in tqdm(glob.glob(os.path.join(test_dir, "*.tar")), desc="Lettura Test"):
-        with tarfile.open(tf, "r") as tar:
-            json_m = next(m for m in tar.getmembers() if m.name.endswith('.json'))
-            img_m = next(m for m in tar.getmembers() if m.name.endswith('.png'))
-            fmri_m = next(m for m in tar.getmembers() if m.name.endswith('.voxel.pyd'))
-            
-            config = json.loads(tar.extractfile(json_m).read().decode('utf-8'))
-            img_name = config['img_name']
-            
-            fmri_raw = np.load(io.BytesIO(tar.extractfile(fmri_m).read()), allow_pickle=True).flatten()
-            
-            if img_name not in test_dict:
-                test_dict[img_name] = {'fmris': [], 'img': Image.open(tar.extractfile(img_m)).convert("RGB")}
-            test_dict[img_name]['fmris'].append(fmri_raw)
-
-    # Seleziona 4 immagini dal test set (preferibilmente quelle con più ripetizioni)
-    sorted_test_keys = sorted(test_dict.keys(), key=lambda k: len(test_dict[k]['fmris']), reverse=True)
-    sampled_test_keys = sorted_test_keys[4:8]
-    test_results = []
-
-    for key in sampled_test_keys:
-        data = test_dict[key]
-        img = data['img']
-        num_trials = len(data['fmris'])
+        orig_pil = Image.open(gt_path).convert("RGB").resize((512, 512))
+        mask_path = os.path.join(masks_dir, id_to_maskname[f])
+        mask_np, bbox = None, None
         
-        gt_depth = get_midas_gt(img, depth_processor, depth_model, device)
+        if os.path.exists(mask_path): 
+            mask_np = np.load(mask_path).reshape(64, 64)
+            mask_pil_64 = Image.fromarray((mask_np * 255).astype(np.uint8))
+            bbox_64 = mask_pil_64.getbbox()
+            if bbox_64: 
+                bbox = (bbox_64[0]*8, bbox_64[1]*8, bbox_64[2]*8, bbox_64[3]*8)
+
+        if mask_np is None: continue
+
+        fg_pil = apply_smart_mask(orig_pil, mask_np, bbox, "foreground")
+        bg_pil = apply_smart_mask(orig_pil, mask_np, bbox, "background")
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        axes[0].imshow(orig_pil)
+        axes[0].set_title(f"Originale\n({id_to_filename[f]})", fontsize=14)
+        axes[0].axis('off')
         
-        # 🚨 LA MEDIA DEI TRIAL 🚨
-        fmri_avg = np.mean(data['fmris'], axis=0)
-        fmri_vec = torch.tensor(fmri_avg, dtype=torch.float32).to(device).unsqueeze(0)
-        fmri_z = (fmri_vec - x_mean) / (x_std + 1e-6)
+        axes[1].imshow(fg_pil)
+        axes[1].set_title(f"Foreground\n(Sfondo sfocato + BBox Crop)", fontsize=14)
+        axes[1].axis('off')
         
-        with torch.no_grad():
-            pred_depth = aligner(fmri_z).cpu().numpy().reshape(64, 64)
-            
-        test_results.append((img, gt_depth, pred_depth, num_trials))
+        axes[2].imshow(bg_pil)
+        axes[2].set_title(f"Background\n(Soggetto sfocato)", fontsize=14)
+        axes[2].axis('off')
+        
+        plt.tight_layout()
+        save_path = os.path.join(out_dir, f"plot_{os.path.splitext(id_to_filename[f])[0]}.png")
+        plt.savefig(save_path, dpi=150)
+        plt.close()
 
-    # ==========================================
-    # PLOTTING
-    # ==========================================
-    fig, axes = plt.subplots(8, 3, figsize=(12, 24))
-    plt.subplots_adjust(hspace=0.4)
-    
-    # Plot Train
-    for i, (img, gt, pred) in enumerate(train_results):
-        axes[i, 0].imshow(img); axes[i, 0].set_title(f"Train {i+1} Originale"); axes[i, 0].axis('off')
-        axes[i, 1].imshow(gt, cmap='inferno', vmin=0, vmax=1); axes[i, 1].set_title("GT (MiDaS)"); axes[i, 1].axis('off')
-        axes[i, 2].imshow(pred, cmap='inferno', vmin=0, vmax=1); axes[i, 2].set_title("Predizione fMRI"); axes[i, 2].axis('off')
-
-    # Plot Test
-    for i, (img, gt, pred, trials) in enumerate(test_results):
-        row = i + 4
-        axes[row, 0].imshow(img); axes[row, 0].set_title(f"Test {i+1} Orig (Media {trials} trial)"); axes[row, 0].axis('off')
-        axes[row, 1].imshow(gt, cmap='inferno', vmin=0, vmax=1); axes[row, 1].set_title("GT (MiDaS)"); axes[row, 1].axis('off')
-        axes[row, 2].imshow(pred, cmap='inferno', vmin=0, vmax=1); axes[row, 2].set_title("Predizione fMRI (Mediata)"); axes[row, 2].axis('off')
-
-    plt.suptitle("Check Profondità: Train (Single-Trial) vs Test (Averaged fMRI)", fontsize=16, fontweight='bold', y=0.92)
-    save_path = "check_depth_predictions.png"
-    plt.savefig(save_path, bbox_inches='tight', dpi=150)
-    print(f"\n✅ Dashboard salvata! Apri: {save_path}")
+    print(f"✅ Finito! Controlla i plot nella cartella: {out_dir}")
 
 if __name__ == "__main__":
     main()
